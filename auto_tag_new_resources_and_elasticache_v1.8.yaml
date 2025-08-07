@@ -1,0 +1,548 @@
+# 脚本功能：通过EventBridge自动获取CloudTrail中资源创建的event，触发lambda给没有打Owner标签的资源实例打上Owner标签，标签键为“Owner”，标签值为event中操作用户的用户名
+# v1.8 增加支持ElastiCache和Opensearch Domain，由于Elasticache和Opensearch Domain需要等待资源状态就绪后才能打标签，所以使用Step Functions状态机先等待1800秒再执行Lambda函数
+# v1.7 增加支持Opensearch serverless collection
+# v1.6 增加支持NAT Gateway
+# v1.5 增加支持eks worknode，与eks cluster的标签一致，不使用EKS关联的role
+# v1.4 增加支持EKS，自动创建lambda role
+# v1.3 增加支持RDS
+# v1.2 修复ELB部分代码bug
+# v1.1 增加事件中用户为IAM Role的情况
+# v1.0 支持 EC2 Instance、Elastic IP、EBS Volume、ELB
+AWSTemplateFormatVersion: 2010-09-09
+Description: A CloudFormation template to create a EventBridege rule and a Lambda function for automatically add tag to newly created resources.
+# Resources section
+Resources:
+###################################################################################################
+# Auto tag Common resouces
+    EventRuleforNewResourcesCreation:
+        Type: AWS::Events::Rule
+        Properties:
+          Description: Monitor new resources creation Events
+          EventPattern: 
+              source:
+                  - aws.ec2
+                  - aws.elasticloadbalancing
+                  - aws.rds
+                  - aws.eks
+                  - aws.aoss
+              detail-type:
+                  - AWS API Call via CloudTrail
+              detail:
+                  eventSource:
+                      - ec2.amazonaws.com
+                      - elasticloadbalancing.amazonaws.com
+                      - rds.amazonaws.com
+                      - eks.amazonaws.com
+                      - aoss.amazonaws.com
+                  eventName:
+                      - RunInstances
+                      - AllocateAddress
+                      - CreateLoadBalancer
+                      - CreateVolume
+                      - CreateDBInstance
+                      - CreateDBCluster
+                      - CreateCluster
+                      - CreateNatGateway
+                      - CreateCollection
+          Name: monitor_new_resources_creation
+          State: ENABLED
+          Targets:
+            - Arn: !GetAtt LambdaFunctionforAutoAddResourcesTags.Arn
+              Id: "LambdaTarget"
+    LambdaExcutionRole:
+        Type: 'AWS::IAM::Role'
+        Properties:
+          AssumeRolePolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Principal:
+                  Service: lambda.amazonaws.com
+                Action: 'sts:AssumeRole'
+          ManagedPolicyArns:
+            - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+          Policies:
+            - PolicyName: ResourceTaggingPolicy
+              PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Sid: VisualEditor0
+                    Effect: Allow
+                    Action:
+                      - rds:AddTagsToResource
+                      - es:AddTags
+                      - ec2:CreateTags
+                      - eks:TagResource
+                      - elasticloadbalancing:AddTags
+                      - eks:ListTagsForResource
+                      - es:AddTags
+                      - aoss:TagResource
+                      - elasticache:AddTagsToResource
+                      - elasticache:DescribeReplicationGroups
+                      - elasticache:DescribeServerlessCaches
+                      - elasticache:DescribeCacheClusters
+                    Resource: '*'
+    LambdaFunctionforAutoAddResourcesTags:
+        Type: AWS::Lambda::Function
+        Properties:
+          Code: 
+            ZipFile: |
+                # Lambda Function
+                import boto3
+                
+                def lambda_handler(event, context):
+                    # 设置标签键
+                    tag_key = "Owner"
+                
+                    # 获取事务类型
+                    event_source = event["detail"]["eventSource"]
+                    event_name = event["detail"]["eventName"]
+                    event_type = event["detail"]["userIdentity"]["type"]
+                
+                    # 获取操作用户的用户名
+                    if event_type=="IAMUser":  # 操作用户是IAM User
+                        user = event["detail"]["userIdentity"]["userName"]
+                    elif event_type=="Root":  # 操作用户是Root
+                        user = 'root'
+                    elif event_type=="AssumedRole":  # 操作用户是IAM Role
+                        if event_source=="ec2.amazonaws.com" and event_name=="RunInstances":
+                            if "tagSet" in event["detail"]["responseElements"]["instancesSet"]["items"][0]:   # 处理EKS创建的node，将tag设置为与创建eks的用户一致
+                                tag_items = event["detail"]["responseElements"]["instancesSet"]["items"][0]["tagSet"]["items"]
+                                ekscluster_name = ""
+                                for tag_item in tag_items:
+                                    if tag_item["key"]=="eks:eks-cluster-name" or tag_item["key"]=="eks:cluster-name":
+                                        ekscluster_name = tag_item["value"]
+                                if ekscluster_name:
+                                    account_id = event["detail"]["responseElements"]["ownerId"]
+                                    aws_region = event["detail"]["awsRegion"]
+                                    ekscluster_arn = f"arn:aws:eks:{aws_region}:{account_id}:cluster/{ekscluster_name}"
+                                    eks_client = boto3.client('eks')
+                                    listtags_response = eks_client.list_tags_for_resource(
+                                        resourceArn=ekscluster_arn
+                                    )
+                                    if "Owner" in listtags_response["tags"]:
+                                        user = listtags_response["tags"]["Owner"]
+                                else:
+                                    user = event["detail"]["userIdentity"]["sessionContext"]["sessionIssuer"]["userName"]
+                            else:
+                                user = event["detail"]["userIdentity"]["sessionContext"]["sessionIssuer"]["userName"]
+                        else:
+                            user = event["detail"]["userIdentity"]["sessionContext"]["sessionIssuer"]["userName"]
+                
+                    # 定义变量，默认需要打标签
+                    add_tag = True
+                
+                    # 判断事务类型，并根据是否已有Owner标签给资源对应打标签
+                    if event_source=="ec2.amazonaws.com":  #EC2事件
+                        #处理EC2
+                        if event_name=="RunInstances":
+                            items = event["detail"]["responseElements"]["instancesSet"]["items"]  #获取instances信息
+                            for item in items:
+                                if "tagSet" in item:  #实例有任意标签
+                                    tags = item["tagSet"]["items"]
+                                    if any(tag['key']==tag_key for tag in tags):  #实例没有Owner标签
+                                        add_tag = False
+                                if add_tag:   #tag_owner=True时给EC2打标签
+                                    instanceid = item["instanceId"]
+                                    ec2_client = boto3.client('ec2')
+                                    ec2_client.create_tags(
+                                        Resources=[
+                                            instanceid,
+                                        ],
+                                        Tags=[
+                                            {
+                                                'Key': tag_key,
+                                                'Value': user
+                                            },
+                                        ]
+                                    )
+                        #处理EIP
+                        elif event_name=="AllocateAddress":  
+                            if "tagSpecificationSet" in event["detail"]["requestParameters"]:  #实例有任意标签
+                                for item in event["detail"]["requestParameters"]["tagSpecificationSet"]["items"]:
+                                    if item["resourceType"]=="elastic-ip":
+                                        tags = item["tags"]
+                                        if any(tag['key']==tag_key for tag in tags):  #实例没有Owner标签
+                                            add_tag = False  #不需要打owner标签
+                            if add_tag:  #tag_owner=True时给ip打标签
+                                allocationid = event["detail"]["responseElements"]["allocationId"]
+                                ec2_client = boto3.client('ec2')
+                                ec2_client.create_tags(
+                                    Resources=[
+                                        allocationid,
+                                    ],
+                                    Tags=[
+                                        {
+                                            'Key': tag_key,
+                                            'Value': user
+                                        },
+                                    ]
+                                )
+                        #处理EBS卷事件
+                        elif event_name=="CreateVolume":  
+                            if "tagSet" in event["detail"]["responseElements"]:  #实例有任意标签
+                                tags = event["detail"]["responseElements"]["tagSet"]["items"]
+                                if any(tag['key']==tag_key for tag in tags):  #实例没有Owner标签
+                                    add_tag = False  #不需要打owner标签
+                            if add_tag:
+                                volumeid = event["detail"]["responseElements"]["volumeId"]
+                                ec2_client = boto3.client('ec2')
+                                ec2_client.create_tags(
+                                    Resources=[
+                                        volumeid,
+                                    ],
+                                    Tags=[
+                                        {
+                                            'Key': tag_key,
+                                            'Value': user
+                                        },
+                                    ]
+                                )
+                        # 处理NGW
+                        elif event_name=="CreateNatGateway":
+                            if "tagSet" in event["detail"]["responseElements"]["CreateNatGatewayResponse"]["natGateway"]:
+                                tags = event["detail"]["responseElements"]["CreateNatGatewayResponse"]["natGateway"]["tagSet"]["item"]
+                                if any(tag['key']==tag_key for tag in tags):  #实例没有Owner标签
+                                    add_tag = False  #不需要打owner标签
+                            if add_tag:
+                                natgatewayid = event["detail"]["responseElements"]["CreateNatGatewayResponse"]["natGateway"]["natGatewayId"]
+                                ec2_client = boto3.client('ec2')
+                                ec2_client.create_tags(
+                                    Resources=[
+                                        natgatewayid,
+                                    ],
+                                    Tags=[
+                                        {
+                                            'Key': tag_key,
+                                            'Value': user
+                                        },
+                                    ]
+                                )
+                    elif event_source=="elasticloadbalancing.amazonaws.com":  # ELB事件
+                        #创建ELB事件
+                        if event_name=="CreateLoadBalancer":
+                            if "tags" in event["detail"]["requestParameters"]:  #实例有任意标签
+                                tags = event["detail"]["requestParameters"]["tags"]
+                                if any(tag['key']==tag_key for tag in tags):  #实例没有Owner标签
+                                    add_tag = False  #不需要打owner标签
+                            if add_tag:
+                                loadbalancers = event["detail"]["responseElements"]["loadBalancers"]
+                                for loadbalancer in loadbalancers:
+                                    loadbalancer_arn = loadbalancer["loadBalancerArn"]
+                                    elb_client = boto3.client('elbv2')
+                                    elb_client.add_tags(
+                                        ResourceArns=[
+                                            loadbalancer_arn,
+                                        ],
+                                        Tags=[
+                                            {
+                                                'Key': tag_key,
+                                                'Value': user
+                                            },
+                                        ]
+                                    )
+                    elif event_source=="rds.amazonaws.com":
+                        if event_name=="CreateDBInstance":
+                            if "tagList" in event["detail"]["responseElements"]:
+                                tags = event["detail"]["responseElements"]["tagList"]
+                                if any(tag['key']==tag_key for tag in tags):  #实例没有Owner标签
+                                    add_tag = False  #不需要打owner标签
+                            if add_tag:
+                                dbinstance_arn = event["detail"]["responseElements"]["dBInstanceArn"]
+                                rds_client = boto3.client('rds')
+                                rds_client.add_tags_to_resource(
+                                    ResourceName=dbinstance_arn,
+                                    Tags=[
+                                        {
+                                            'Key': tag_key,
+                                            'Value': user
+                                        },
+                                    ]
+                                )
+                        elif event_name=="CreateDBCluster":
+                            if "tagList" in event["detail"]["responseElements"]:
+                                tags = event["detail"]["responseElements"]["tagList"]
+                                if any(tag['key']==tag_key for tag in tags):  #实例没有Owner标签
+                                    add_tag = False  #不需要打owner标签
+                            if add_tag:
+                                dbcluster_arn = event["detail"]["responseElements"]["dBClusterArn"]
+                                rds_client = boto3.client('rds')
+                                rds_client.add_tags_to_resource(
+                                    ResourceName=dbcluster_arn,
+                                    Tags=[
+                                        {
+                                            'Key': tag_key,
+                                            'Value': user
+                                        },
+                                    ]
+                                )
+                                if event["detail"]["responseElements"]["dBClusterMembers"]:
+                                    # 从Cluster中提取region和account id
+                                    dbcluster_arn_parts = dbcluster_arn.split(":")
+                                    region = dbcluster_arn_parts[3]
+                                    account_id = dbcluster_arn_parts[4]
+                                    for dbcluster_member in event["detail"]["responseElements"]["dBClusterMembers"]:
+                                        dbinstance_indentifier = dbcluster_member["dBInstanceIdentifier"]
+                                        dbinstance_arn = f"arn:aws:rds:{region}:{account_id}:db:{dbinstance_identifier}"
+                                        rds_client.add_tags_to_resource(
+                                            ResourceName=dbinstance_arn,
+                                            Tags=[
+                                                {
+                                                    'Key': tag_key,
+                                                    'Value': user
+                                                },
+                                            ]
+                                        )
+                    elif event_source=="eks.amazonaws.com":
+                        if event_name=="CreateCluster":
+                            tags = event["detail"]["responseElements"]["cluster"]["tags"]  #这是一个字典类型
+                            if "Owner" in tags:
+                                add_tag = False
+                            if add_tag:
+                                eks_arn = event["detail"]["responseElements"]["cluster"]["arn"]
+                                eks_client = boto3.client('eks')
+                                eks_client.tag_resource(
+                                    resourceArn=eks_arn,
+                                    tags={
+                                        tag_key: user
+                                    }
+                                )
+                    elif event_source=="aoss.amazonaws.com":
+                        if event_name=="CreateCollection":
+                            if "tags" in event["detail"]["requestParameters"]:
+                                tags = event["detail"]["requestParameters"]["tags"]
+                                if any(tag['key']==tag_key for tag in tags):  #实例没有Owner标签
+                                    add_tag = False  #不需要打owner标签
+                            if add_tag:
+                                opensearch_collection_arn = event["detail"]["responseElements"]["createCollectionDetail"]["arn"]
+                                opensearch_serverless_client = boto3.client('opensearchserverless')
+                                opensearch_serverless_client.tag_resource(
+                                    resourceArn=opensearch_collection_arn,
+                                    tags=[
+                                        {
+                                            'key': tag_key,
+                                            'value': user
+                                        },
+                                    ]
+                                )
+          Description: Receive new resources creation events and add tag to new resources
+          FunctionName: auto-tag-new-resources-without-owner
+          Handler: index.lambda_handler
+          Role: !GetAtt LambdaExcutionRole.Arn
+          Runtime: python3.9
+          Tags: 
+            - Key: Owner
+              Value: abbine
+          Timeout: 180
+    
+    LambdaInvokePermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+          Action: lambda:InvokeFunction
+          FunctionName: !Ref LambdaFunctionforAutoAddResourcesTags
+          Principal: events.amazonaws.com
+          SourceArn: !GetAtt EventRuleforNewResourcesCreation.Arn
+          
+###################################################################################################
+# ElastiCache and Opensearch specific resources with Step Functions
+    EventRuleforElastiCacheandESCreation:
+        Type: AWS::Events::Rule
+        Properties:
+          Description: Monitor ElastiCache and Opensearch creation Events
+          EventPattern: 
+              source:
+                  - aws.elasticache
+                  - aws.es
+              detail-type:
+                  - AWS API Call via CloudTrail
+              detail:
+                  eventSource:
+                      - elasticache.amazonaws.com
+                      - es.amazonaws.com
+                  eventName:
+                      - CreateCacheCluster
+                      - CreateReplicationGroup
+                      - CreateServerlessCache
+                      - CreateDomain
+          Name: monitor_elasticache_and_es_creation
+          State: ENABLED
+          Targets:
+            - Arn: !GetAtt ElastiCacheandESTaggingStateMachine.Arn
+              Id: "StepFunctionTarget"
+              RoleArn: !GetAtt EventBridgeStepFunctionRole.Arn
+
+    LambdaFunctionforAutoTagElastiCacheandES:
+        Type: AWS::Lambda::Function
+        Properties:
+          Code: 
+            ZipFile: |
+                # Lambda Function
+                import boto3
+                import time
+                
+                def lambda_handler(event, context):
+                    # 设置标签键
+                    tag_key = "Owner"
+                    
+                    # 获取操作用户的用户名
+                    if event["detail"]["userIdentity"]["type"]=="IAMUser":  # 操作用户是IAM User
+                        user = event["detail"]["userIdentity"]["userName"]
+                    elif event["detail"]["userIdentity"]["type"]=="Root":  # 操作用户是Root
+                        user = 'root'
+                    elif event["detail"]["userIdentity"]["type"]=="AssumedRole":  # 操作用户是IAM Role
+                        user = event["detail"]["userIdentity"]["sessionContext"]["sessionIssuer"]["userName"]
+                    
+                    # 获取事务类型
+                    event_source = event["detail"]["eventSource"]
+                    event_name = event["detail"]["eventName"]
+                
+                    # 定义变量，默认需要打标签
+                    add_tag = True
+                    
+                    # 判断事务类型，并根据是否已有Owner标签给资源对应打标签
+                    if event_source=="elasticache.amazonaws.com":
+                        tags = event["detail"]["requestParameters"]["tags"]
+                        if any(tag['key']==tag_key for tag in tags):  #实例没有Owner标签
+                            add_tag = False  #不需要打owner标签
+                        if add_tag:
+                            elasticache_client = boto3.client('elasticache')
+                            status = "creating"
+                            while status=="creating":
+                                #获取elasticache状态，未available的状态没法打标签
+                                if event_name=="CreateReplicationGroup":
+                                    replicationgroup_id = event["detail"]["responseElements"]["replicationGroupId"]
+                                    replicationgroup_response = elasticache_client.describe_replication_groups(
+                                                                    ReplicationGroupId=replicationgroup_id
+                                                                )
+                                    status = replicationgroup_response["ReplicationGroups"][0]["Status"]
+                                    elasticache_arn = event["detail"]["responseElements"]["aRN"]
+                                elif event_name=="CreateCacheCluster":
+                                    cachecluster_id = event["detail"]["responseElements"]["cacheClusterId"]
+                                    cachecluster_response = elasticache_client.describe_cache_clusters(
+                                                                CacheClusterId=cachecluster_id
+                                                            )
+                                    status = cachecluster_response["CacheClusters"][0]["CacheClusterStatus"]
+                                    elasticache_arn = event["detail"]["responseElements"]["aRN"]
+                                elif event_name=="CreateServerlessCache":
+                                    serverlesscache_name = event["detail"]["responseElements"]["serverlessCache"]["serverlessCacheName"]
+                                    serverlesscache_response = elasticache_client.describe_serverless_caches(
+                                                                    ServerlessCacheName=serverlesscache_name
+                                                               )
+                                    status = serverlesscache_response["ServerlessCaches"][0]["Status"]
+                                    elasticache_arn = event["detail"]["responseElements"]["serverlessCache"]["aRN"]
+                                time.sleep(10)
+                            if status=="available":
+                                elasticache_client.add_tags_to_resource(
+                                    ResourceName=elasticache_arn,
+                                    Tags=[
+                                        {
+                                            'Key': tag_key,
+                                            'Value': user
+                                        },
+                                    ]
+                                )
+                    elif event_source=="es.amazonaws.com":
+                        if event_name=="CreateDomain":
+                            if "tagList" in event["detail"]["requestParameters"]:
+                                tags = event["detail"]["requestParameters"]["tagList"]
+                                if any(tag['key']==tag_key for tag in tags):  #实例没有Owner标签
+                                    add_tag = False  #不需要打owner标签
+                            if add_tag:
+                                opensearch_arn = event["detail"]["responseElements"]["domainStatus"]["aRN"]
+                                opensearch_client = boto3.client('opensearch')
+                                opensearch_client.add_tags(
+                                    ARN=opensearch_arn,
+                                    TagList=[
+                                        {
+                                            'Key': tag_key,
+                                            'Value': user
+                                        },
+                                    ]
+                                )
+          Description: Receive ElastiCache and Opensearch creation events and add Owner tag to new ElastiCache resources
+          FunctionName: auto-tag-elasticache-and-opensearch-resources-without-owner
+          Handler: index.lambda_handler
+          Role: !GetAtt LambdaExcutionRole.Arn
+          Runtime: python3.9
+          Tags: 
+            - Key: Owner
+              Value: abbine
+          Timeout: 300
+
+    # Step Functions State Machine
+    ElastiCacheandESTaggingStateMachine:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+          StateMachineName: ElastiCacheandESAutoTaggingWorkflow
+          DefinitionString: !Sub |
+            {
+              "Comment": "ElastiCache and Opensearch Domain auto tagging workflow with delay",
+              "TimeoutSeconds": 2000,
+              "StartAt": "WaitForElastiCacheandESReady",
+              "States": {
+                "WaitForElastiCacheandESReady": {
+                  "Type": "Wait",
+                  "Seconds": 1800,
+                  "Next": "TagElastiCacheandESResource"
+                },
+                "TagElastiCacheandESResource": {
+                  "Type": "Task",
+                  "Resource": "${LambdaFunctionforAutoTagElastiCacheandES.Arn}",
+                  "End": true,
+                  "Retry": [
+                    {
+                      "ErrorEquals": ["States.TaskFailed"],
+                      "IntervalSeconds": 30,
+                      "MaxAttempts": 3,
+                      "BackoffRate": 2.0
+                    }
+                  ]
+                }
+              }
+            }
+          RoleArn: !GetAtt StepFunctionExecutionRole.Arn
+          Tags:
+            - Key: Owner
+              Value: abbine
+
+    # IAM Role for EventBridge to invoke Step Functions
+    EventBridgeStepFunctionRole:
+        Type: AWS::IAM::Role
+        Properties:
+          AssumeRolePolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Principal:
+                  Service: events.amazonaws.com
+                Action: sts:AssumeRole
+          Policies:
+            - PolicyName: StepFunctionExecutionPolicy
+              PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Action:
+                      - states:StartExecution
+                    Resource: !GetAtt ElastiCacheandESTaggingStateMachine.Arn
+
+    # IAM Role for Step Functions execution
+    StepFunctionExecutionRole:
+        Type: AWS::IAM::Role
+        Properties:
+          AssumeRolePolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Principal:
+                  Service: states.amazonaws.com
+                Action: sts:AssumeRole
+          Policies:
+            - PolicyName: LambdaInvokePolicy
+              PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Action:
+                      - lambda:InvokeFunction
+                    Resource: !GetAtt LambdaFunctionforAutoTagElastiCacheandES.Arn
